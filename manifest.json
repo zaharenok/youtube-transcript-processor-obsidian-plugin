@@ -1,0 +1,11 @@
+{
+	"id": "youtube-transcript-processor",
+	"name": "YouTube Transcript Processor",
+	"version": "1.0.0",
+	"minAppVersion": "0.15.0",
+	"description": "Process YouTube videos and create structured notes from transcripts",
+	"author": "zaharenok",
+	"authorUrl": "https://github.com/zaharenok",
+	"fundingUrl": "https://github.com/sponsors/zaharenok",
+	"isDesktopOnly": false
+}
