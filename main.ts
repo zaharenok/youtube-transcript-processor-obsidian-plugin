@@ -1,8 +1,6 @@
 import { App, Editor, MarkdownView, Modal, Notice, Plugin, Setting, PluginSettingTab, TFile, requestUrl, EditorPosition } from 'obsidian';
 
 interface YouTubeTranscriptPluginSettings {
-  processingUrl: string;
-  httpMethod: 'GET' | 'POST';
   language: string; // 'auto' | 'ru' | 'en' | ...
   includeTitle: boolean;
   githubUrl: string;
@@ -11,11 +9,11 @@ interface YouTubeTranscriptPluginSettings {
   backgroundMode: boolean; // run without blocking modal
   dailyNoteUrl: string;
   showCreditsInfo: boolean; // показывать информацию о балансе
+  isFirstRun: boolean; // показать приветственный экран
+  onboardingCompleted: boolean; // завершено ли знакомство
 }
 
 const DEFAULT_SETTINGS: YouTubeTranscriptPluginSettings = {
-  processingUrl: 'https://n8n.aaagency.at/webhook/9b601faa-5f51-477a-9d23-e95104ccd35d',
-  httpMethod: 'POST',
   language: 'en',
   includeTitle: true,
   githubUrl: 'https://github.com/olegzakhark',
@@ -24,6 +22,8 @@ const DEFAULT_SETTINGS: YouTubeTranscriptPluginSettings = {
   backgroundMode: true,
   dailyNoteUrl: '',
   showCreditsInfo: true,
+  isFirstRun: true,
+  onboardingCompleted: false,
 };
 
 const DAILY_NOTE_TRANSCRIPT_MARKER = '<!-- YOUTUBE_TRANSCRIPT_PROCESSED -->';
@@ -36,6 +36,19 @@ export default class YouTubeTranscriptPlugin extends Plugin {
 
   async onload() {
     await this.loadSettings();
+
+    // Register custom protocol handler for obsidian://ytp-auth
+    this.registerObsidianProtocolHandler('ytp-auth', (params) => {
+      this.handleAuthProtocol(params);
+    });
+
+    // Show welcome modal on first run
+    if (this.settings.isFirstRun) {
+      // Delay to ensure UI is ready
+      setTimeout(() => {
+        new WelcomeModal(this.app, this).open();
+      }, 1000);
+    }
 
     // Ribbon icon
     this.addRibbonIcon('youtube', 'Process YouTube video', () => {
@@ -137,6 +150,140 @@ export default class YouTubeTranscriptPlugin extends Plugin {
       }, 1000 * 60 * 60)); // every hour
   }
 
+  // Handle obsidian://ytp-auth protocol
+  private handleAuthProtocol(params: any) {
+    console.log('Auth protocol called with params:', params);
+    
+    if (params.token) {
+      this.settings.authToken = params.token;
+      this.saveSettings();
+      new Notice('🔐 Authentication token received and saved!');
+      
+      // Validate the token immediately
+      this.validateToken(params.token)
+        .then(isValid => {
+          if (isValid) {
+            new Notice('✅ Token validated successfully!');
+            this.showStatus('✅ Authenticated');
+            setTimeout(() => this.clearStatus(), 3000);
+          } else {
+            new Notice('❌ Token validation failed');
+            this.showStatus('❌ Invalid token');
+            setTimeout(() => this.clearStatus(), 5000);
+          }
+        })
+        .catch(error => {
+          console.error('Token validation error:', error);
+          new Notice('❌ Token validation error');
+        });
+    } else if (params.code) {
+      // Handle device code flow
+      this.handleDeviceCode(params.code);
+    } else {
+      new Notice('❌ Invalid authentication data received');
+    }
+  }
+
+  // Validate token by making a test request
+  public async validateToken(token: string): Promise<boolean> {
+    try {
+      const endpoint = 'https://n8n.aaagency.at/webhook/9b601faa-5f51-477a-9d23-e95104ccd35d';
+      
+      const testData = {
+        video_url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', // Test video
+        source: 'obsidian-plugin-validation',
+        language: 'English',
+        include_title: false,
+        token: token,
+        validation_only: true // Flag to indicate this is just validation
+      };
+
+      const response = await requestUrl({
+        url: endpoint,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(testData),
+      });
+
+      if (response.status === 200) {
+        const data = this.parseResponse(response);
+        return !data.error; // Valid if no error in response
+      }
+      
+      return false;
+    } catch (error) {
+      console.error('Token validation request failed:', error);
+      return false;
+    }
+  }
+
+  // Handle device code authentication flow
+  private async handleDeviceCode(code: string) {
+    new Notice(`🔐 Processing device code: ${code}`);
+    
+    try {
+      // Poll the backend for device code authorization
+      const result = await this.pollDeviceCodeAuth(code);
+      
+      if (result.token) {
+        this.settings.authToken = result.token;
+        await this.saveSettings();
+        new Notice('✅ Device authenticated successfully!');
+        this.showStatus('✅ Device linked');
+        setTimeout(() => this.clearStatus(), 3000);
+      } else {
+        new Notice('❌ Device authentication failed');
+      }
+    } catch (error) {
+      console.error('Device code authentication error:', error);
+      new Notice('❌ Device authentication error');
+    }
+  }
+
+  // Poll backend for device code authentication
+  private async pollDeviceCodeAuth(code: string): Promise<any> {
+    const pollEndpoint = 'https://n8n.aaagency.at/webhook/device-auth-poll';
+    const maxAttempts = 30; // 5 minutes with 10-second intervals
+    
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        const response = await requestUrl({
+          url: pollEndpoint,
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            device_code: code,
+            source: 'obsidian-plugin'
+          }),
+        });
+
+        if (response.status === 200) {
+          const data = this.parseResponse(response);
+          
+          if (data.status === 'authorized' && data.token) {
+            return { token: data.token };
+          } else if (data.status === 'pending') {
+            // Continue polling
+            await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds
+            continue;
+          } else {
+            throw new Error(data.error || 'Authorization failed');
+          }
+        } else {
+          throw new Error(`HTTP ${response.status}`);
+        }
+      } catch (error) {
+        console.error(`Device auth poll attempt ${attempt + 1} failed:`, error);
+        if (attempt === maxAttempts - 1) {
+          throw error;
+        }
+        await new Promise(resolve => setTimeout(resolve, 10000)); // Wait before retry
+      }
+    }
+    
+    throw new Error('Device authorization timeout');
+  }
+
   private async processDailyNote() {
     const dailyNotePath = this.getDailyNotePath();
     const file = this.app.vault.getAbstractFileByPath(dailyNotePath);
@@ -189,8 +336,8 @@ export default class YouTubeTranscriptPlugin extends Plugin {
   }
 
   private async fetchTranscript(url: string): Promise<{ title: string; content: string } | null> {
-    const endpoint = this.settings.processingUrl;
-    const method = this.settings.httpMethod;
+    const endpoint = 'https://n8n.aaagency.at/webhook/9b601faa-5f51-477a-9d23-e95104ccd35d';
+    const method = 'POST';
 
     // Валидация токена
     if (!this.settings.authToken || this.settings.authToken.trim() === '') {
@@ -216,6 +363,7 @@ export default class YouTubeTranscriptPlugin extends Plugin {
             'zh': 'Chinese',
             'ja': 'Japanese',
             'ko': 'Korean',
+            'ru': 'Russian',
         };
 
         const requestData = {
@@ -455,7 +603,7 @@ ${JSON.stringify(data, null, 2).substring(0, 500)}...`
     });
   }
 
-  private async processYouTubeUrl(url: string, targetFile?: TFile) {
+  public async processYouTubeUrl(url: string, targetFile?: TFile) {
     const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (!activeView) return;
 
@@ -472,8 +620,8 @@ ${JSON.stringify(data, null, 2).substring(0, 500)}...`
     try {
         console.log('=== START PROCESSING YouTube URL ===');
         console.log('URL:', url);
-        console.log('Method:', this.settings.httpMethod);
-        console.log('Endpoint:', this.settings.processingUrl);
+        console.log('Method:', 'POST');
+        console.log('Endpoint:', 'https://n8n.aaagency.at/webhook/9b601faa-5f51-477a-9d23-e95104ccd35d');
         
         // Запускаем таймер обратного отсчета
         this.startCountdownTimer();
@@ -627,9 +775,14 @@ ${JSON.stringify(data, null, 2).substring(0, 500)}...`
       }
     });
     
-    // Также удаляем HTML комментарии загрузки из текста
+    // Удаляем HTML комментарии и текст загрузки из содержимого
     const currentContent = editor.getValue();
-    const cleanedContent = currentContent.replace(/<!-- youtube-loading-\d+ -->\n?/g, '');
+    let cleanedContent = currentContent
+      .replace(/<!-- youtube-loading-\d+ -->\n?/g, '')
+      .replace(/⏳ Processing YouTube video\.\.\.\n?/g, '')
+      .replace(/\n\n⏳ Processing YouTube video\.\.\.\n\n/g, '')
+      .replace(/^⏳ Processing YouTube video\.\.\.\n?/gm, '');
+    
     if (currentContent !== cleanedContent) {
       editor.setValue(cleanedContent);
     }
@@ -815,33 +968,235 @@ class YouTubeTranscriptSettingsTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  private async startDeviceCodeFlow() {
+    try {
+      const deviceCodeEndpoint = 'https://n8n.aaagency.at/webhook/device-auth-start';
+      
+      const response = await requestUrl({
+        url: deviceCodeEndpoint,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          source: 'obsidian-plugin',
+          client_info: {
+            plugin_version: '2.2.0',
+            obsidian_version: (window as any).app?.appVersion || 'unknown'
+          }
+        }),
+      });
+
+      if (response.status === 200) {
+        const data = JSON.parse(response.text);
+        
+        if (data.device_code && data.user_code) {
+          // Show device code modal
+          new DeviceCodeModal(this.app, data.device_code, data.user_code, data.verification_url).open();
+        } else {
+          new Notice('❌ Failed to generate device code');
+        }
+      } else {
+        new Notice('❌ Device code generation failed');
+      }
+    } catch (error) {
+      console.error('Device code generation error:', error);
+      new Notice('❌ Error generating device code');
+    }
+  }
+
+  private createSupportSection(containerEl: HTMLElement) {
+    // Create dedicated support section container
+    const supportContainer = containerEl.createDiv('support-links-section');
+    
+    // Header
+    const header = supportContainer.createDiv('support-links-header');
+    const title = header.createDiv('support-links-title');
+    title.innerHTML = '💖 Support & Community';
+    const subtitle = header.createDiv('support-links-subtitle');
+    subtitle.textContent = 'Help improve this plugin and connect with the community';
+    
+    // Cards grid
+    const grid = supportContainer.createDiv('support-links-grid');
+    
+    // GitHub card
+    const githubCard = grid.createDiv('support-link-card github-card');
+    
+    const githubIcon = githubCard.createDiv('support-link-icon');
+    githubIcon.innerHTML = '🐙'; // Using octopus emoji as GitHub icon
+    
+    const githubTitle = githubCard.createDiv('support-link-title');
+    githubTitle.textContent = 'View on GitHub';
+    
+    const githubDesc = githubCard.createDiv('support-link-description');
+    githubDesc.textContent = 'Source code, issues, and feature requests';
+    
+    const githubBtn = githubCard.createEl('button', { cls: 'support-link-btn' });
+    githubBtn.innerHTML = `
+      <span style="font-size: 16px; margin-right: 4px;">⭐</span>
+      Star on GitHub
+    `;
+    
+    const githubUrl = githubCard.createDiv('support-link-url');
+    githubUrl.textContent = this.plugin.settings.githubUrl || 'https://github.com/olegzakhark';
+    
+    githubBtn.addEventListener('click', () => {
+      window.open(this.plugin.settings.githubUrl || 'https://github.com/olegzakhark', '_blank');
+      // Add pulse effect
+      githubCard.addClass('pulse');
+      setTimeout(() => githubCard.removeClass('pulse'), 2000);
+    });
+    
+    // Coffee card
+    const coffeeCard = grid.createDiv('support-link-card coffee-card');
+    
+    const coffeeIcon = coffeeCard.createDiv('support-link-icon');
+    coffeeIcon.innerHTML = '☕';
+    
+    const coffeeTitle = coffeeCard.createDiv('support-link-title');
+    coffeeTitle.textContent = 'Buy Me a Coffee';
+    
+    const coffeeDesc = coffeeCard.createDiv('support-link-description');
+    coffeeDesc.textContent = 'Support development with a small donation';
+    
+    const coffeeBtn = coffeeCard.createEl('button', { cls: 'support-link-btn' });
+    coffeeBtn.innerHTML = `
+      <span style="font-size: 16px; margin-right: 4px;">💝</span>
+      Buy Coffee
+    `;
+    
+    const coffeeSlug = this.plugin.settings.buyMeACoffeeSlug || 'olegzakhark';
+    const coffeeUrl = coffeeCard.createDiv('support-link-url');
+    coffeeUrl.textContent = `buymeacoffee.com/${coffeeSlug}`;
+    
+    coffeeBtn.addEventListener('click', () => {
+      window.open(`https://www.buymeacoffee.com/${coffeeSlug}`, '_blank');
+      // Add pulse effect
+      coffeeCard.addClass('pulse');
+      setTimeout(() => coffeeCard.removeClass('pulse'), 2000);
+    });
+    
+    // Optional stats section (can be enabled later)
+    const stats = supportContainer.createDiv('support-stats');
+    stats.style.display = 'none'; // Hide for now
+    
+    const starsStat = stats.createDiv('support-stat');
+    starsStat.innerHTML = `
+      <span class="support-stat-number">✨</span>
+      <span class="support-stat-label">Open Source</span>
+    `;
+    
+    const usersStat = stats.createDiv('support-stat');
+    usersStat.innerHTML = `
+      <span class="support-stat-number">🚀</span>
+      <span class="support-stat-label">Active Development</span>
+    `;
+    
+    const updatesStat = stats.createDiv('support-stat');
+    updatesStat.innerHTML = `
+      <span class="support-stat-number">💪</span>
+      <span class="support-stat-label">Community Driven</span>
+    `;
+    
+    // Add hidden settings for URL management (for advanced users)
+    this.createHiddenSupportSettings(containerEl);
+  }
+  
+  private createHiddenSupportSettings(containerEl: HTMLElement) {
+    // Hidden/collapsed section for URL editing
+    const advancedContainer = containerEl.createDiv();
+    advancedContainer.style.display = 'none';
+    advancedContainer.id = 'advanced-support-settings';
+    
+    new Setting(advancedContainer)
+      .setName('GitHub URL')
+      .setDesc('Repository/profile link (advanced)')
+      .addText(text => text
+        .setPlaceholder('https://github.com/olegzakhark')
+        .setValue(this.plugin.settings.githubUrl)
+        .onChange(async (value) => {
+          this.plugin.settings.githubUrl = value.trim();
+          await this.plugin.saveSettings();
+          // Update the display URL in the card
+          const urlEl = containerEl.querySelector('.github-card .support-link-url');
+          if (urlEl) urlEl.textContent = value.trim() || 'https://github.com/olegzakhark';
+        }));
+    
+    new Setting(advancedContainer)
+      .setName('Buy Me a Coffee Slug')
+      .setDesc('Username for Buy Me a Coffee (advanced)')
+      .addText(text => text
+        .setPlaceholder('olegzakhark')
+        .setValue(this.plugin.settings.buyMeACoffeeSlug)
+        .onChange(async (value) => {
+          this.plugin.settings.buyMeACoffeeSlug = value.trim();
+          await this.plugin.saveSettings();
+          // Update the display URL in the card
+          const urlEl = containerEl.querySelector('.coffee-card .support-link-url');
+          if (urlEl) urlEl.textContent = `buymeacoffee.com/${value.trim() || 'olegzakhark'}`;
+        }));
+    
+    // Toggle button for advanced settings
+    const toggleContainer = containerEl.createDiv();
+    toggleContainer.style.textAlign = 'center';
+    toggleContainer.style.marginTop = '15px';
+    
+    const toggleBtn = toggleContainer.createEl('button', {
+      text: '⚙️ Advanced Support Settings',
+      cls: 'support-advanced-toggle'
+    });
+    toggleBtn.style.background = 'transparent';
+    toggleBtn.style.border = '1px solid var(--background-modifier-border)';
+    toggleBtn.style.color = 'var(--text-muted)';
+    toggleBtn.style.padding = '8px 16px';
+    toggleBtn.style.borderRadius = '6px';
+    toggleBtn.style.fontSize = '12px';
+    toggleBtn.style.cursor = 'pointer';
+    toggleBtn.style.transition = 'all 0.3s ease';
+    
+    let isAdvancedVisible = false;
+    toggleBtn.addEventListener('click', () => {
+      isAdvancedVisible = !isAdvancedVisible;
+      advancedContainer.style.display = isAdvancedVisible ? 'block' : 'none';
+      toggleBtn.textContent = isAdvancedVisible ? '🔼 Hide Advanced Settings' : '⚙️ Advanced Support Settings';
+    });
+    
+    toggleBtn.addEventListener('mouseenter', () => {
+      toggleBtn.style.background = 'var(--background-modifier-hover)';
+      toggleBtn.style.color = 'var(--text-normal)';
+    });
+    
+    toggleBtn.addEventListener('mouseleave', () => {
+      toggleBtn.style.background = 'transparent';
+      toggleBtn.style.color = 'var(--text-muted)';
+    });
+  }
+
+  private updateAuthStatus(containerEl: HTMLElement) {
+    containerEl.empty();
+    
+    const statusEl = containerEl.createDiv('auth-status');
+    
+    if (this.plugin.settings.authToken && this.plugin.settings.authToken.length > 16) {
+      statusEl.innerHTML = `
+        <div class="auth-status-good">
+          <span class="auth-status-icon">✅</span>
+          <span class="auth-status-text">Authenticated</span>
+        </div>
+      `;
+    } else {
+      statusEl.innerHTML = `
+        <div class="auth-status-warning">
+          <span class="auth-status-icon">⚠️</span>
+          <span class="auth-status-text">Not authenticated</span>
+        </div>
+      `;
+    }
+  }
+
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
 
     containerEl.createEl('h2', { text: 'YouTube Transcript Processor — Settings' });
-
-    new Setting(containerEl)
-      .setName('Processing URL')
-      .setDesc('n8n webhook address (/webhook/... or /webhook-test/...)')
-      .addText(text => text
-        .setPlaceholder('https://your-n8n/webhook/xxxxx')
-        .setValue(this.plugin.settings.processingUrl)
-        .onChange(async (value) => {
-          this.plugin.settings.processingUrl = value.trim();
-          await this.plugin.saveSettings();
-        }));
-
-    new Setting(containerEl)
-      .setName('HTTP Method')
-      .setDesc('POST for production /webhook, GET for /webhook-test (test only)')
-      .addDropdown(drop => drop
-        .addOptions({ POST: 'POST', GET: 'GET' })
-        .setValue(this.plugin.settings.httpMethod)
-        .onChange(async (value: 'GET' | 'POST') => {
-          this.plugin.settings.httpMethod = value;
-          await this.plugin.saveSettings();
-        }));
 
     new Setting(containerEl)
       .setName('Output language')
@@ -859,6 +1214,7 @@ class YouTubeTranscriptSettingsTab extends PluginSettingTab {
           zh: 'Chinese',
           ja: 'Japanese',
           ko: 'Korean',
+          ru: 'Russian',
         })
         .setValue(this.plugin.settings.language || 'en')
         .onChange(async (value) => {
@@ -893,48 +1249,64 @@ class YouTubeTranscriptSettingsTab extends PluginSettingTab {
 
     containerEl.createEl('hr');
 
-    new Setting(containerEl)
-      .setName('GitHub')
-      .setDesc('Repository/profile link')
-      .addText(text => text
-        .setPlaceholder('https://github.com/olegzakhark')
-        .setValue(this.plugin.settings.githubUrl)
-        .onChange(async (value) => {
-          this.plugin.settings.githubUrl = value.trim();
-          await this.plugin.saveSettings();
-        }))
-      .addButton(btn => btn
-        .setButtonText('Open')
-        .onClick(() => {
-          window.open(this.plugin.settings.githubUrl, '_blank');
-        }));
+    // Create support section
+    this.createSupportSection(containerEl);
 
+    containerEl.createEl('hr');
+    containerEl.createEl('h3', { text: 'Authentication' });
+    
+    // Authentication status
+    const authStatusEl = containerEl.createDiv('auth-status-container');
+    this.updateAuthStatus(authStatusEl);
+    
+    // Sign in with code button
     new Setting(containerEl)
-      .setName('Buy Me a Coffee')
-      .setDesc('Support the author')
-      .addText(text => text
-        .setPlaceholder('olegzakhark')
-        .setValue(this.plugin.settings.buyMeACoffeeSlug)
-        .onChange(async (value) => {
-          this.plugin.settings.buyMeACoffeeSlug = value.trim();
-          await this.plugin.saveSettings();
-        }))
+      .setName('Sign in with device code')
+      .setDesc('Recommended: Generate a device code and authenticate via dashboard')
       .addButton(btn => btn
-        .setButtonText('Buy me a coffee ☕')
-        .onClick(() => {
-          const slug = this.plugin.settings.buyMeACoffeeSlug || 'olegzakhark';
-          window.open(`https://www.buymeacoffee.com/${slug}`, '_blank');
+        .setButtonText('Generate Code')
+        .setCta()
+        .onClick(async () => {
+          await this.startDeviceCodeFlow();
         }));
-
+    
+    // Manual token input (fallback)
     new Setting(containerEl)
-      .setName('Auth Token')
-      .setDesc('Token to send with every webhook call')
+      .setName('Manual Token Entry')
+      .setDesc('Fallback: Paste your token manually')
       .addText(text => text
-        .setPlaceholder('secret-token')
+        .setPlaceholder('Enter your token here')
         .setValue(this.plugin.settings.authToken)
         .onChange(async (value) => {
           this.plugin.settings.authToken = value;
           await this.plugin.saveSettings();
+          this.updateAuthStatus(authStatusEl);
+        }))
+      .addButton(btn => btn
+        .setButtonText('Validate')
+        .onClick(async () => {
+          if (!this.plugin.settings.authToken) {
+            new Notice('❌ Please enter a token first');
+            return;
+          }
+          
+          const isValid = await this.plugin.validateToken(this.plugin.settings.authToken);
+          if (isValid) {
+            new Notice('✅ Token is valid!');
+          } else {
+            new Notice('❌ Token is invalid');
+          }
+          this.updateAuthStatus(authStatusEl);
+        }));
+    
+    // Open dashboard button
+    new Setting(containerEl)
+      .setName('Open Dashboard')
+      .setDesc('Manage your account and tokens online')
+      .addButton(btn => btn
+        .setButtonText('Open Dashboard')
+        .onClick(() => {
+          window.open('https://n8n.aaagency.at/dashboard', '_blank');
         }));
 
     new Setting(containerEl)
@@ -1052,6 +1424,200 @@ class ProcessingConfirmModal extends Modal {
   onClose() {
     const { contentEl } = this;
     contentEl.empty();
+  }
+}
+
+class WelcomeModal extends Modal {
+  private plugin: YouTubeTranscriptPlugin;
+
+  constructor(app: App, plugin: YouTubeTranscriptPlugin) {
+    super(app);
+    this.plugin = plugin;
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass('welcome-modal');
+    
+    // Header
+    const header = contentEl.createEl('div', { cls: 'welcome-header' });
+    header.createEl('h1', { text: '🎥 Welcome to YouTube Transcript Processor!' });
+    header.createEl('p', { text: 'Transform any YouTube video into structured notes with AI-powered processing.' });
+    
+    // Features list
+    const features = contentEl.createEl('div', { cls: 'welcome-features' });
+    features.createEl('h3', { text: 'What you can do:' });
+    
+    const featuresList = features.createEl('ul', { cls: 'welcome-features-list' });
+    const li1 = featuresList.createEl('li');
+    li1.innerHTML = '📋 <strong>Paste any YouTube URL</strong> - Get instant transcript processing';
+    const li2 = featuresList.createEl('li');
+    li2.innerHTML = '🌍 <strong>Multiple languages</strong> - Support for English, Spanish, Russian, and more';
+    const li3 = featuresList.createEl('li');
+    li3.innerHTML = '✨ <strong>AI-enhanced content</strong> - Smart formatting and structure';
+    const li4 = featuresList.createEl('li');
+    li4.innerHTML = '🚀 <strong>Seamless integration</strong> - Works directly in your notes';
+    
+    // Quick start section
+    const quickStart = contentEl.createEl('div', { cls: 'welcome-quickstart' });
+    quickStart.createEl('h3', { text: 'Get started in 3 steps:' });
+    
+    const steps = quickStart.createEl('div', { cls: 'welcome-steps' });
+    
+    const step1 = steps.createEl('div', { cls: 'welcome-step' });
+    step1.createEl('div', { text: '1', cls: 'welcome-step-number' });
+    const step1Content = step1.createEl('div', { cls: 'welcome-step-content' });
+    step1Content.createEl('strong', { text: 'Connect your account' });
+    step1Content.createEl('p', { text: 'Get 50 free transcripts included!' });
+    
+    const step2 = steps.createEl('div', { cls: 'welcome-step' });
+    step2.createEl('div', { text: '2', cls: 'welcome-step-number' });
+    const step2Content = step2.createEl('div', { cls: 'welcome-step-content' });
+    step2Content.createEl('strong', { text: 'Paste a YouTube URL' });
+    step2Content.createEl('p', { text: 'Any video with subtitles works' });
+    
+    const step3 = steps.createEl('div', { cls: 'welcome-step' });
+    step3.createEl('div', { text: '3', cls: 'welcome-step-number' });
+    const step3Content = step3.createEl('div', { cls: 'welcome-step-content' });
+    step3Content.createEl('strong', { text: 'Process & enjoy!' });
+    step3Content.createEl('p', { text: 'Watch the magic happen in real-time' });
+    
+    // Actions
+    const actions = contentEl.createEl('div', { cls: 'welcome-actions' });
+    
+    const primaryBtn = actions.createEl('button', {
+      text: '🔐 Connect Account (Recommended)',
+      cls: 'welcome-primary-btn'
+    });
+    primaryBtn.addEventListener('click', () => {
+      this.close();
+      // Open settings to authentication section
+      (this.app as any).setting.open();
+      (this.app as any).setting.openTabById('youtube-transcript-processor');
+    });
+    
+    const tryBtn = actions.createEl('button', {
+      text: '🚀 Try Demo Video',
+      cls: 'welcome-secondary-btn'
+    });
+    tryBtn.addEventListener('click', async () => {
+      this.close();
+      // Try with a demo video
+      const demoUrl = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+      await this.plugin.processYouTubeUrl(demoUrl);
+      new Notice('🎥 Demo video processing started! Check your note for results.');
+    });
+    
+    const skipBtn = actions.createEl('button', {
+      text: 'Skip for now',
+      cls: 'welcome-skip-btn'
+    });
+    skipBtn.addEventListener('click', () => {
+      this.close();
+    });
+    
+    // Footer
+    const footer = contentEl.createEl('div', { cls: 'welcome-footer' });
+    const footerP = footer.createEl('p');
+    footerP.innerHTML = '✨ Questions? Check our <a href="https://github.com/olegzakhark/youtube-obsidian-plugin" target="_blank">GitHub page</a> or <a href="https://n8n.aaagency.at/support" target="_blank">get support</a>.';
+  }
+
+  onClose() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.removeClass('welcome-modal');
+    
+    // Mark first run as completed
+    this.plugin.settings.isFirstRun = false;
+    this.plugin.saveSettings();
+  }
+}
+
+class DeviceCodeModal extends Modal {
+  private deviceCode: string;
+  private userCode: string;
+  private verificationUrl: string;
+
+  constructor(app: App, deviceCode: string, userCode: string, verificationUrl: string) {
+    super(app);
+    this.deviceCode = deviceCode;
+    this.userCode = userCode;
+    this.verificationUrl = verificationUrl || 'https://n8n.aaagency.at/device-auth';
+  }
+
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.addClass('device-code-modal');
+    
+    // Header
+    const header = contentEl.createEl('div', { cls: 'device-code-header' });
+    header.createEl('h2', { text: '🔐 Connect to Dashboard' });
+    header.createEl('p', { text: 'Follow these steps to authenticate your Obsidian plugin:' });
+    
+    // Step 1
+    const step1 = contentEl.createEl('div', { cls: 'device-code-step' });
+    step1.createEl('h3', { text: '1. Open Dashboard' });
+    const dashboardBtn = step1.createEl('button', { 
+      text: 'Open Dashboard',
+      cls: 'device-code-primary-btn'
+    });
+    dashboardBtn.addEventListener('click', () => {
+      window.open(this.verificationUrl, '_blank');
+    });
+    
+    // Step 2
+    const step2 = contentEl.createEl('div', { cls: 'device-code-step' });
+    step2.createEl('h3', { text: '2. Enter this code:' });
+    
+    const codeContainer = step2.createEl('div', { cls: 'device-code-container' });
+    const codeEl = codeContainer.createEl('div', { 
+      text: this.userCode,
+      cls: 'device-code-display'
+    });
+    
+    const copyBtn = codeContainer.createEl('button', {
+      text: '📋 Copy',
+      cls: 'device-code-copy-btn'
+    });
+    copyBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(this.userCode).then(() => {
+        copyBtn.textContent = '✅ Copied!';
+        setTimeout(() => {
+          copyBtn.textContent = '📋 Copy';
+        }, 2000);
+      });
+    });
+    
+    // Step 3
+    const step3 = contentEl.createEl('div', { cls: 'device-code-step' });
+    step3.createEl('h3', { text: '3. Click "Connect to Obsidian"' });
+    step3.createEl('p', { text: 'Your plugin will be authenticated automatically.' });
+    
+    // QR Code placeholder (if backend provides it)
+    const qrSection = contentEl.createEl('div', { cls: 'device-code-qr' });
+    qrSection.createEl('p', { text: 'Or scan QR code with your phone:', cls: 'device-code-qr-text' });
+    qrSection.createEl('div', { text: '[QR Code would go here]', cls: 'device-code-qr-placeholder' });
+    
+    // Footer
+    const footer = contentEl.createEl('div', { cls: 'device-code-footer' });
+    footer.createEl('p', { 
+      text: 'This code expires in 10 minutes.',
+      cls: 'device-code-expiry'
+    });
+    
+    const closeBtn = footer.createEl('button', {
+      text: 'Close',
+      cls: 'device-code-close-btn'
+    });
+    closeBtn.addEventListener('click', () => this.close());
+  }
+
+  onClose() {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.removeClass('device-code-modal');
   }
 }
 
